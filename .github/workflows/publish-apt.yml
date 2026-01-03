@@ -115,6 +115,48 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           set -e
+          
+          echo "=== incoming BEFORE normalize ==="
+          find incoming -maxdepth 2 -print || true
+          
+          # Ако deb-ове са директно в incoming/, премести ги в incoming/<suite>/ според Version
+          shopt -s nullglob
+          for deb in incoming/*.deb; do
+            ver="$(dpkg-deb -f "$deb" Version 2>/dev/null || true)"
+            suite=""
+          
+            case "$ver" in
+              *~bookworm*) suite="bookworm" ;;
+              *~trixie*)   suite="trixie" ;;
+            esac
+          
+            # fallback по име на файла (ако Version не помогне)
+            if [ -z "$suite" ]; then
+              base="$(basename "$deb")"
+              case "$base" in
+                *~bookworm*) suite="bookworm" ;;
+                *~trixie*)   suite="trixie" ;;
+              esac
+            fi
+          
+            if [ -z "$suite" ]; then
+              echo "WARN: cannot infer suite for $deb (Version=$ver) -> skipping"
+              continue
+            fi
+          
+            mkdir -p "incoming/${suite}"
+            mv -v "$deb" "incoming/${suite}/"
+          done
+          
+          echo "=== incoming AFTER normalize ==="
+          find incoming -maxdepth 3 -type f -name '*.deb' -print || true
+          
+          # fail-fast ако пак няма нищо по suite
+          if ! find incoming -mindepth 2 -maxdepth 2 -type f -name '*.deb' -print -quit >/dev/null; then
+            echo "ERROR: No incoming/<suite>/*.deb found -> nothing to publish."
+            exit 1
+          fi
+
           rm -rf public
           mkdir -p "public/pool/${COMP}"
 
