@@ -24,7 +24,7 @@ jobs:
 
       # Репота, от които ще дърпаш artifacts (по един на ред)
       SOURCE_REPOS: |
-        hristoandreev/gqrx
+        hristoandreev/gqrx-wolfberry
         hristoandreev/linux_wolfberry
 
     steps:
