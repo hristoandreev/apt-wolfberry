@@ -24,7 +24,7 @@ jobs:
 
       # Репота, от които ще дърпаш artifacts (по един на ред)
       SOURCE_REPOS: |
-        hristoandreev/gqrx-wolfberry
+        hristoandreev/gqrx
         hristoandreev/linux_wolfberry
 
     steps:
@@ -175,6 +175,15 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+
+      - name: Debug public tree
+        run: |
+          set -e
+          echo "=== incoming ==="
+          find incoming -maxdepth 3 -type f -name '*.deb' -print || true
+      
+          echo "=== public ==="
+          find public -maxdepth 6 -type f -print | sort || true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
