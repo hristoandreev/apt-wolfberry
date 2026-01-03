@@ -1,0 +1,200 @@
+name: Publish signed APT repo (multi-suite) from other repos' Release assets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */1 * * *"   # на 1 часа (по желание)
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+
+    env:
+      COMP: main
+      ARCH: arm64
+
+      # Списък репота, от които дърпаш .deb (latest release)
+      # Формат: owner/repo (по един на ред)
+      SOURCE_REPOS: |
+        hristoandreev/gqrx
+        hristoandreev/linux_wolfberry
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl jq gnupg dpkg-dev apt-utils
+
+      - name: Download .deb assets from latest releases (suite from "bookworm/..." or label)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }} # optional, но препоръчително (rate limits)
+        run: |
+          set -e
+          rm -rf incoming
+          mkdir -p incoming
+
+          auth_header=""
+          if [ -n "${GH_TOKEN:-}" ]; then
+            auth_header="Authorization: Bearer ${GH_TOKEN}"
+          fi
+
+          while IFS= read -r REPO; do
+            [ -z "$REPO" ] && continue
+            echo "==> repo: $REPO"
+
+            JSON="$(curl -fsSL \
+              ${auth_header:+-H "$auth_header"} \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/releases/latest")"
+
+            # Взимаме само .deb assets: name, label, asset_api_url
+            echo "$JSON" | jq -r '
+              .assets[]
+              | select(.name | endswith(".deb"))
+              | [.name, (.label // ""), .url]
+              | @tsv
+            ' | while IFS=$'\t' read -r NAME LABEL ASSET_API_URL; do
+                # suite от "bookworm/..." (име)
+                suite=""
+                filename="$NAME"
+
+                case "$NAME" in
+                  */*)
+                    suite="${NAME%%/*}"
+                    filename="${NAME#*/}"
+                    ;;
+                esac
+
+                # fallback: suite от label (ако няма / или ако GitHub е “санитизирал” името)
+                if [ -z "$suite" ]; then
+                  if [ -n "$LABEL" ]; then
+                    # приемаме label да е "bookworm" или "suite=bookworm"
+                    suite="${LABEL#suite=}"
+                  else
+                    echo "WARN: cannot determine suite for asset name='$NAME' (no prefix and no label); skipping"
+                    continue
+                  fi
+                fi
+
+                # нормализирай suite (само букви/цифри/.-_)
+                suite="$(printf '%s' "$suite" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
+                [ -z "$suite" ] && { echo "WARN: suite empty after normalize; skipping"; continue; }
+
+                mkdir -p "incoming/${suite}"
+                outpath="incoming/${suite}/${filename}"
+
+                echo "  downloading: suite=${suite} file=${filename}"
+                curl -fsSL -L \
+                  ${auth_header:+-H "$auth_header"} \
+                  -H "Accept: application/octet-stream" \
+                  "$ASSET_API_URL" \
+                  -o "$outpath"
+              done
+
+          done <<< "$SOURCE_REPOS"
+
+          echo "Downloaded:"
+          find incoming -type f -name '*.deb' -maxdepth 2 -print || true
+          test -n "$(find incoming -type f -name '*.deb' -print -quit)" || (echo "ERROR: no .deb downloaded" && exit 1)
+
+      - name: Import APT signing key (base64)
+        env:
+          APT_GPG_PRIVATE_KEY_B64: ${{ secrets.APT_GPG_PRIVATE_KEY_B64 }}
+        run: |
+          set -e
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+
+          if [ -z "${APT_GPG_PRIVATE_KEY_B64:-}" ]; then
+            echo "ERROR: Secret APT_GPG_PRIVATE_KEY_B64 is missing."
+            exit 1
+          fi
+
+          printf '%s' "$APT_GPG_PRIVATE_KEY_B64" | base64 -d | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
+          [ -n "$KEYID" ] || (echo "ERROR: No secret key imported" && exit 1)
+          echo "SIGNING_KEYID=$KEYID" >> "$GITHUB_ENV"
+          gpg --list-secret-keys --keyid-format=long
+
+      - name: Build signed APT repo (dists/<suite>/main/binary-arm64/...) for Pages
+        env:
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -e
+          rm -rf public
+          mkdir -p "public/pool/${COMP}"
+
+          # публикувай публичния ключ за клиентите (commit-нат в repo-то)
+          if [ -f repo-key.asc ]; then
+            cp -v repo-key.asc public/repo-key.asc
+          fi
+
+          # копирай deb-овете в pool по suite
+          for suite_dir in incoming/*; do
+            [ -d "$suite_dir" ] || continue
+            suite="$(basename "$suite_dir")"
+            mkdir -p "public/pool/${COMP}/${suite}"
+            cp -v "$suite_dir"/*.deb "public/pool/${COMP}/${suite}/" || true
+          done
+
+          # генерирай индекси + Release + подписи за всяка suite
+          cd public
+          for suite_path in pool/${COMP}/*; do
+            [ -d "$suite_path" ] || continue
+            SUITE="$(basename "$suite_path")"
+
+            echo "==> Building dists/${SUITE} ..."
+            mkdir -p "dists/${SUITE}/${COMP}/binary-${ARCH}"
+
+            dpkg-scanpackages -m "pool/${COMP}/${SUITE}" /dev/null > \
+              "dists/${SUITE}/${COMP}/binary-${ARCH}/Packages"
+            gzip -9fk "dists/${SUITE}/${COMP}/binary-${ARCH}/Packages"
+
+            cat > apt-ftparchive.conf <<EOF
+              APT::FTPArchive::Release::Origin "Wolfberry";
+              APT::FTPArchive::Release::Label "Wolfberry APT";
+              APT::FTPArchive::Release::Suite "${SUITE}";
+              APT::FTPArchive::Release::Codename "${SUITE}";
+              APT::FTPArchive::Release::Architectures "${ARCH}";
+              APT::FTPArchive::Release::Components "${COMP}";
+              APT::FTPArchive::Release::Description "Wolfberry aggregated APT repo";
+            EOF
+
+            apt-ftparchive -c apt-ftparchive.conf release "dists/${SUITE}" > "dists/${SUITE}/Release"
+
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$APT_GPG_PASSPHRASE" \
+              --default-key "$SIGNING_KEYID" \
+              --digest-algo SHA256 \
+              --clearsign -o "dists/${SUITE}/InRelease" "dists/${SUITE}/Release"
+
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$APT_GPG_PASSPHRASE" \
+              --default-key "$SIGNING_KEYID" \
+              --digest-algo SHA256 \
+              -abs -o "dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release"
+          done
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
