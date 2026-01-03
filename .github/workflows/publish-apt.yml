@@ -173,7 +173,7 @@ jobs:
               -abs -o "dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release"
           done
 
-          printf 'Wolfberry APT OK %s\n' "$(date -u)" > public/index.html
+          printf 'Wolfberry APT OK %s\n' "$(date -u)" > index.html
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
