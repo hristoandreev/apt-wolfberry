@@ -1,9 +1,9 @@
-name: Publish signed APT repo (multi-suite) from other repos' Release assets
+name: Publish signed APT repo (multi-suite) from Actions artifacts
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */1 * * *"   # на 1 часа (по желание)
+    - cron: "0 */1 * * *"   # по желание
 
 concurrency:
   group: pages
@@ -22,8 +22,7 @@ jobs:
       COMP: main
       ARCH: arm64
 
-      # Списък репота, от които дърпаш .deb (latest release)
-      # Формат: owner/repo (по един на ред)
+      # Репота, от които ще дърпаш artifacts (по един на ред)
       SOURCE_REPOS: |
         hristoandreev/gqrx
         hristoandreev/linux_wolfberry
@@ -36,79 +35,61 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            curl jq gnupg dpkg-dev apt-utils
+            curl jq unzip gnupg dpkg-dev apt-utils
 
-      - name: Download .deb assets from latest releases (suite from "bookworm/..." or label)
+      - name: Download latest apt-* artifacts from repos
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }} # optional, но препоръчително (rate limits)
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -e
-          rm -rf incoming
-          mkdir -p incoming
+          rm -rf incoming zips
+          mkdir -p incoming zips
 
-          auth_header=""
-          if [ -n "${GH_TOKEN:-}" ]; then
-            auth_header="Authorization: Bearer ${GH_TOKEN}"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "ERROR: missing secret GH_TOKEN (needs Actions:Read for source repos)."
+            exit 1
           fi
 
           while IFS= read -r REPO; do
             [ -z "$REPO" ] && continue
             echo "==> repo: $REPO"
 
+            # Взимаме списък artifacts (до 100), филтрираме apt-*, не-expired,
+            # сортираме по created_at desc и взимаме най-новия за всяко име.
             JSON="$(curl -fsSL \
-              ${auth_header:+-H "$auth_header"} \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/releases/latest")"
+              "https://api.github.com/repos/${REPO}/actions/artifacts?per_page=100")"
 
-            # Взимаме само .deb assets: name, label, asset_api_url
             echo "$JSON" | jq -r '
-              .assets[]
-              | select(.name | endswith(".deb"))
-              | [.name, (.label // ""), .url]
+              .artifacts
+              | map(select(.expired==false))
+              | map(select(.name | startswith("apt-")))
+              | sort_by(.created_at) | reverse
+              | unique_by(.name)
+              | .[]
+              | [.name, .archive_download_url]
               | @tsv
-            ' | while IFS=$'\t' read -r NAME LABEL ASSET_API_URL; do
-                # suite от "bookworm/..." (име)
-                suite=""
-                filename="$NAME"
+            ' | while IFS=$'\t' read -r ANAME ADL; do
+                [ -z "$ANAME" ] && continue
+                echo "  artifact: $ANAME"
 
-                case "$NAME" in
-                  */*)
-                    suite="${NAME%%/*}"
-                    filename="${NAME#*/}"
-                    ;;
-                esac
+                ZIP="zips/${REPO//\//_}__${ANAME}.zip"
 
-                # fallback: suite от label (ако няма / или ако GitHub е “санитизирал” името)
-                if [ -z "$suite" ]; then
-                  if [ -n "$LABEL" ]; then
-                    # приемаме label да е "bookworm" или "suite=bookworm"
-                    suite="${LABEL#suite=}"
-                  else
-                    echo "WARN: cannot determine suite for asset name='$NAME' (no prefix and no label); skipping"
-                    continue
-                  fi
-                fi
-
-                # нормализирай suite (само букви/цифри/.-_)
-                suite="$(printf '%s' "$suite" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
-                [ -z "$suite" ] && { echo "WARN: suite empty after normalize; skipping"; continue; }
-
-                mkdir -p "incoming/${suite}"
-                outpath="incoming/${suite}/${filename}"
-
-                echo "  downloading: suite=${suite} file=${filename}"
                 curl -fsSL -L \
-                  ${auth_header:+-H "$auth_header"} \
-                  -H "Accept: application/octet-stream" \
-                  "$ASSET_API_URL" \
-                  -o "$outpath"
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "$ADL" -o "$ZIP"
+
+                # Вътре очакваме директория bookworm/...deb или trixie/...deb
+                unzip -o "$ZIP" -d incoming >/dev/null
               done
 
           done <<< "$SOURCE_REPOS"
 
-          echo "Downloaded:"
-          find incoming -type f -name '*.deb' -maxdepth 2 -print || true
-          test -n "$(find incoming -type f -name '*.deb' -print -quit)" || (echo "ERROR: no .deb downloaded" && exit 1)
+          echo "Incoming content:"
+          find incoming -maxdepth 3 -type f -name '*.deb' -print || true
+          test -n "$(find incoming -type f -name '*.deb' -print -quit)" || (echo "ERROR: no .deb found in incoming/" && exit 1)
 
       - name: Import APT signing key (base64)
         env:
@@ -119,7 +100,7 @@ jobs:
           chmod 700 ~/.gnupg
 
           if [ -z "${APT_GPG_PRIVATE_KEY_B64:-}" ]; then
-            echo "ERROR: Secret APT_GPG_PRIVATE_KEY_B64 is missing."
+            echo "ERROR: missing secret APT_GPG_PRIVATE_KEY_B64"
             exit 1
           fi
 
@@ -137,40 +118,44 @@ jobs:
           rm -rf public
           mkdir -p "public/pool/${COMP}"
 
-          # публикувай публичния ключ за клиентите (commit-нат в repo-то)
+          # Публикувай публичния ключ за клиентите (commit-нат в това repo)
           if [ -f repo-key.asc ]; then
             cp -v repo-key.asc public/repo-key.asc
           fi
 
-          # копирай deb-овете в pool по suite
+          # Suites се определят от директориите в incoming/ (bookworm/, trixie/, ...)
           for suite_dir in incoming/*; do
             [ -d "$suite_dir" ] || continue
-            suite="$(basename "$suite_dir")"
-            mkdir -p "public/pool/${COMP}/${suite}"
-            cp -v "$suite_dir"/*.deb "public/pool/${COMP}/${suite}/" || true
+            SUITE="$(basename "$suite_dir")"
+
+            echo "==> suite: $SUITE"
+            mkdir -p "public/pool/${COMP}/${SUITE}"
+            cp -v "$suite_dir"/*.deb "public/pool/${COMP}/${SUITE}/" || true
+
+            mkdir -p "public/dists/${SUITE}/${COMP}/binary-${ARCH}"
           done
 
-          # генерирай индекси + Release + подписи за всяка suite
           cd public
-          for suite_path in pool/${COMP}/*; do
-            [ -d "$suite_path" ] || continue
-            SUITE="$(basename "$suite_path")"
 
-            echo "==> Building dists/${SUITE} ..."
-            mkdir -p "dists/${SUITE}/${COMP}/binary-${ARCH}"
+          # За всяка suite: Packages + Release + подписи
+          for SUITE_PATH in "pool/${COMP}/"*; do
+            [ -d "$SUITE_PATH" ] || continue
+            SUITE="$(basename "$SUITE_PATH")"
+
+            echo "==> index/sign suite: $SUITE"
 
             dpkg-scanpackages -m "pool/${COMP}/${SUITE}" /dev/null > \
               "dists/${SUITE}/${COMP}/binary-${ARCH}/Packages"
             gzip -9fk "dists/${SUITE}/${COMP}/binary-${ARCH}/Packages"
 
             cat > apt-ftparchive.conf <<EOF
-              APT::FTPArchive::Release::Origin "Wolfberry";
-              APT::FTPArchive::Release::Label "Wolfberry APT";
-              APT::FTPArchive::Release::Suite "${SUITE}";
-              APT::FTPArchive::Release::Codename "${SUITE}";
-              APT::FTPArchive::Release::Architectures "${ARCH}";
-              APT::FTPArchive::Release::Components "${COMP}";
-              APT::FTPArchive::Release::Description "Wolfberry aggregated APT repo";
+            APT::FTPArchive::Release::Origin "Wolfberry";
+            APT::FTPArchive::Release::Label "Wolfberry APT";
+            APT::FTPArchive::Release::Suite "${SUITE}";
+            APT::FTPArchive::Release::Codename "${SUITE}";
+            APT::FTPArchive::Release::Architectures "${ARCH}";
+            APT::FTPArchive::Release::Components "${COMP}";
+            APT::FTPArchive::Release::Description "Wolfberry aggregated APT repo";
             EOF
 
             apt-ftparchive -c apt-ftparchive.conf release "dists/${SUITE}" > "dists/${SUITE}/Release"
