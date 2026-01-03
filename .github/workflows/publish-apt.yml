@@ -81,8 +81,18 @@ jobs:
                   -H "Accept: application/vnd.github+json" \
                   "$ADL" -o "$ZIP"
 
-                # Вътре очакваме директория bookworm/...deb или trixie/...deb
-                unzip -o "$ZIP" -d incoming >/dev/null
+                # suite от името на артефакта: apt-<suite>-<arch>
+                suite="${ANAME#apt-}"
+                suite="${suite%-${ARCH}}"
+                suite="$(printf '%s' "$suite" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9._-')"
+                
+                if [ -z "$suite" ] || [ "$suite" = "$ANAME" ]; then
+                  echo "WARN: cannot infer suite from artifact name '$ANAME' (expected apt-<suite>-${ARCH})"
+                  continue
+                fi
+                
+                mkdir -p "incoming/${suite}"
+                unzip -o "$ZIP" -d "incoming/${suite}" >/dev/null
               done
 
           done <<< "$SOURCE_REPOS"
@@ -115,44 +125,11 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           set -e
-          
-          echo "=== incoming BEFORE normalize ==="
-          find incoming -maxdepth 2 -print || true
-          
-          # Ако deb-ове са директно в incoming/, премести ги в incoming/<suite>/ според Version
-          shopt -s nullglob
-          for deb in incoming/*.deb; do
-            ver="$(dpkg-deb -f "$deb" Version 2>/dev/null || true)"
-            suite=""
-          
-            case "$ver" in
-              *~bookworm*) suite="bookworm" ;;
-              *~trixie*)   suite="trixie" ;;
-            esac
-          
-            # fallback по име на файла (ако Version не помогне)
-            if [ -z "$suite" ]; then
-              base="$(basename "$deb")"
-              case "$base" in
-                *~bookworm*) suite="bookworm" ;;
-                *~trixie*)   suite="trixie" ;;
-              esac
-            fi
-          
-            if [ -z "$suite" ]; then
-              echo "WARN: cannot infer suite for $deb (Version=$ver) -> skipping"
-              continue
-            fi
-          
-            mkdir -p "incoming/${suite}"
-            mv -v "$deb" "incoming/${suite}/"
-          done
-          
-          echo "=== incoming AFTER normalize ==="
+
+          echo "=== incoming suites ==="
           find incoming -maxdepth 3 -type f -name '*.deb' -print || true
           
-          # fail-fast ако пак няма нищо по suite
-          if ! find incoming -mindepth 2 -maxdepth 2 -type f -name '*.deb' -print -quit >/dev/null; then
+          if ! find incoming -mindepth 2 -maxdepth 3 -type f -name '*.deb' -print -quit >/dev/null; then
             echo "ERROR: No incoming/<suite>/*.deb found -> nothing to publish."
             exit 1
           fi
@@ -215,7 +192,7 @@ jobs:
               -abs -o "dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release"
           done
 
-          printf 'Wolfberry APT OK %s\n' "$(date -u)" > index.html
+          # printf 'Wolfberry APT OK %s\n' "$(date -u)" > index.html
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
