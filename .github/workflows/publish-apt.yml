@@ -149,14 +149,14 @@ jobs:
             gzip -9fk "dists/${SUITE}/${COMP}/binary-${ARCH}/Packages"
 
             cat > apt-ftparchive.conf <<EOF
-            APT::FTPArchive::Release::Origin "Wolfberry";
-            APT::FTPArchive::Release::Label "Wolfberry APT";
-            APT::FTPArchive::Release::Suite "${SUITE}";
-            APT::FTPArchive::Release::Codename "${SUITE}";
-            APT::FTPArchive::Release::Architectures "${ARCH}";
-            APT::FTPArchive::Release::Components "${COMP}";
-            APT::FTPArchive::Release::Description "Wolfberry aggregated APT repo";
-            EOF
+          APT::FTPArchive::Release::Origin "Wolfberry";
+          APT::FTPArchive::Release::Label "Wolfberry APT";
+          APT::FTPArchive::Release::Suite "${SUITE}";
+          APT::FTPArchive::Release::Codename "${SUITE}";
+          APT::FTPArchive::Release::Architectures "${ARCH}";
+          APT::FTPArchive::Release::Components "${COMP}";
+          APT::FTPArchive::Release::Description "Wolfberry aggregated APT repo";
+          EOF
 
             apt-ftparchive -c apt-ftparchive.conf release "dists/${SUITE}" > "dists/${SUITE}/Release"
 
