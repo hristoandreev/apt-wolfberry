@@ -81,21 +81,50 @@ jobs:
                   -H "Accept: application/vnd.github+json" \
                   "$ADL" -o "$ZIP"
 
-                # suite от името на артефакта: apt-<suite>-<arch>
-                suite="${ANAME#apt-}"
-                suite="${suite%-${ARCH}}"
-                suite="$(printf '%s' "$suite" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9._-')"
+                # --- NEW: suite от името на артефакта: apt-<suite>-<arch> или apt-common-<arch> ---
+                if [ "$ANAME" = "apt-common-${ARCH}" ]; then
+                  suite="_common"
+                else
+                  suite="${ANAME#apt-}"
+                  suite="${suite%-${ARCH}}"
+                  suite="$(printf '%s' "$suite" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9._-')"
                 
-                if [ -z "$suite" ] || [ "$suite" = "$ANAME" ]; then
-                  echo "WARN: cannot infer suite from artifact name '$ANAME' (expected apt-<suite>-${ARCH})"
-                  continue
+                  if [ -z "$suite" ] || [ "$suite" = "$ANAME" ]; then
+                    echo "WARN: cannot infer suite from artifact name '$ANAME' (expected apt-<suite>-${ARCH} or apt-common-${ARCH})"
+                    continue
+                  fi
                 fi
                 
                 mkdir -p "incoming/${suite}"
                 unzip -o "$ZIP" -d "incoming/${suite}" >/dev/null
+
               done
 
           done <<< "$SOURCE_REPOS"
+
+          # --- NEW: fan-out common пакети (kernel и др.) към всички вече налични suites ---
+          if [ -d "incoming/_common" ]; then
+            echo "==> common packages detected -> copying into all existing suites"
+          
+            # намираме suite директориите (всички без _common)
+            suites="$(find incoming -mindepth 1 -maxdepth 1 -type d ! -name '_common' -printf '%f\n' | sort -u)"
+          
+            if [ -z "$suites" ]; then
+              echo "ERROR: common packages exist, but no suite dirs exist (no apt-<suite>-${ARCH} artifacts downloaded)."
+              echo "Build/publish at least one suite artifact first (e.g. apt-bookworm-${ARCH}), then common will be replicated."
+              exit 1
+            fi
+          
+            for s in $suites; do
+              echo "  -> suite: $s"
+              find "incoming/_common" -type f -name '*.deb' -print0 | while IFS= read -r -d '' f; do
+                cp -v "$f" "incoming/$s/"
+              done
+            done
+          
+            # махаме, за да не се третира като suite надолу
+            rm -rf "incoming/_common"
+          fi
 
           echo "Incoming content:"
           find incoming -maxdepth 3 -type f -name '*.deb' -print || true
@@ -149,7 +178,7 @@ jobs:
 
             echo "==> suite: $SUITE"
             mkdir -p "public/pool/${COMP}/${SUITE}"
-            cp -v "$suite_dir"/*.deb "public/pool/${COMP}/${SUITE}/" || true
+            find "$suite_dir" -type f -name '*.deb' -exec cp -v {} "public/pool/${COMP}/${SUITE}/" \; || true
 
             mkdir -p "public/dists/${SUITE}/${COMP}/binary-${ARCH}"
           done
