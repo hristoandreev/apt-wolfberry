@@ -26,6 +26,7 @@ jobs:
       SOURCE_REPOS: |
         hristoandreev/gqrx
         hristoandreev/linux_wolfberry
+        hristoandreev/SoapySDRWolfberry
 
     steps:
       - name: Checkout
