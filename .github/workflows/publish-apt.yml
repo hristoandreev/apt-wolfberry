@@ -2,8 +2,8 @@ name: Publish signed APT repo (multi-suite) from Actions artifacts
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */1 * * *"   # по желание
+  #schedule:
+    #- cron: "0 */1 * * *"   # по желание
 
 concurrency:
   group: pages
